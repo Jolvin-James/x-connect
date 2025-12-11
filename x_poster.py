@@ -1,113 +1,110 @@
 import tweepy
 import time
 import os
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+import pandas as pd
 from dotenv import load_dotenv
 from datetime import datetime
 
-# Load Environment Variables (API Keys)
+# Load credentials
 load_dotenv()
 
-# --- Configuration ---
-SHEET_NAME = "TwitterBot Content" # Exact name of your Google Sheet
-JSON_KEYFILE = "credentials.json" # The file you downloaded from Google
-POSTS_PER_DAY = 15
+API_KEY = os.getenv("X_API_KEY")
+API_SECRET = os.getenv("X_API_SECRET")
+ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN")
+ACCESS_SECRET = os.getenv("X_ACCESS_TOKEN_SECRET")
 
-# --- X (Twitter) Authentication ---
+EXCEL_FILE = "tweets.xlsx"
+
 def get_twitter_conn_v2():
     return tweepy.Client(
-        consumer_key=os.getenv("X_API_KEY"),
-        consumer_secret=os.getenv("X_API_SECRET"),
-        access_token=os.getenv("X_ACCESS_TOKEN"),
-        access_token_secret=os.getenv("X_ACCESS_TOKEN_SECRET")
+        consumer_key=API_KEY,
+        consumer_secret=API_SECRET,
+        access_token=ACCESS_TOKEN,
+        access_token_secret=ACCESS_SECRET
     )
 
-# --- Google Sheets Connection ---
-def get_google_sheet_client():
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(JSON_KEYFILE, scope)
-    client = gspread.authorize(creds)
-    return client
-
-def get_content_and_update():
+def get_content_to_post():
     """
-    Connects to G-Sheets, finds first 'Pending' row, returns text, 
-    and updates status to 'Done'.
+    Reads the Excel file, picks the first 'Pending' tweet, 
+    updates it to 'Done', saves the file, and returns the text.
     """
     try:
-        gc = get_google_sheet_client()
+        # Read the Excel file
+        df = pd.read_excel(EXCEL_FILE)
         
-        # Open the sheet
-        sh = gc.open(SHEET_NAME)
-        worksheet = sh.sheet1 # First tab
-        
-        # Get all records as a list of dictionaries
-        records = worksheet.get_all_records()
-        
-        # Find the first pending tweet
-        row_index_to_update = None
-        tweet_text = None
-        
-        # Iterate through records (starts at index 0 in list, but row 2 in sheet)
-        for i, row in enumerate(records):
-            if row['Status'] == 'Pending':
-                tweet_text = row['Content']
-                # i is the list index. 
-                # Sheet rows start at 1. Header is row 1. Data starts row 2.
-                # So the physical row number is i + 2
-                row_index_to_update = i + 2 
-                break
-        
-        if tweet_text and row_index_to_update:
-            # Update the Status cell to "Done"
-            # Assuming 'Status' is the 2nd column (Column B)
-            worksheet.update_cell(row_index_to_update, 2, "Done")
-            return tweet_text
-        else:
-            print("No 'Pending' tweets found in Google Sheet.")
+        # Ensure columns exist (Sanity check)
+        if 'Status' not in df.columns or 'Content' not in df.columns:
+            print("Error: Excel file must have 'Content' and 'Status' columns.")
             return None
 
+        # Find the first row where Status is 'Pending'
+        pending_tweets = df[df['Status'] == 'Pending']
+        
+        if pending_tweets.empty:
+            print("No 'Pending' tweets found in Excel.")
+            return None
+        
+        # Get the index of the first pending tweet
+        index_to_post = pending_tweets.index[0]
+        
+        # Extract the content
+        tweet_text = df.at[index_to_post, 'Content']
+        
+        # Update the status to 'Done'
+        df.at[index_to_post, 'Status'] = 'Done'
+        
+        # Save the updated dataframe back to Excel
+        # index=False ensures we don't add an extra number column every time
+        df.to_excel(EXCEL_FILE, index=False)
+        
+        return tweet_text
+
+    except FileNotFoundError:
+        print(f"Error: Could not find {EXCEL_FILE}")
+        return None
+    except PermissionError:
+        print(f"Error: Please close {EXCEL_FILE} before running the script.")
+        return None
     except Exception as e:
-        print(f"Google Sheet Error: {e}")
+        print(f"An unexpected error occurred reading Excel: {e}")
         return None
 
 def run_scheduler():
     client = get_twitter_conn_v2()
     
-    interval_seconds = 86400 / POSTS_PER_DAY 
+    posts_per_day = 15
+    interval_seconds = 86400 / posts_per_day 
     
-    print(f"--- X Google Sheet Bot Started ---")
-    print(f"Connected to Sheet: {SHEET_NAME}")
-    
+    print(f"--- X Excel Bot Started ---")
+    print(f"Reading from: {EXCEL_FILE}")
+    print(f"Interval: One post every {interval_seconds/60:.2f} minutes")
+
     while True:
         try:
-            # 1. Get Content
-            tweet_text = get_content_and_update()
+            # 1. Get Content from Excel
+            tweet_text = get_content_to_post()
             
+            # If function returns None, we are out of tweets or have an error
             if tweet_text is None:
-                print("No content found. Checking again in 1 hour...")
-                time.sleep(3600)
-                continue
+                print("Stopping script: No content available or file error.")
+                break 
 
             # 2. Post Tweet
-            print(f"Posting: {tweet_text[:30]}...")
+            print(f"Attempting to post: {tweet_text[:30]}...")
             response = client.create_tweet(text=tweet_text)
-            print(f"[{datetime.now()}] SUCCESS! ID: {response.data['id']}")
             
-            # 3. Wait
+            print(f"[{datetime.now()}] SUCCESS! Tweet Sent. ID: {response.data['id']}")
+            
+            # 3. Wait for next slot
             time.sleep(interval_seconds)
             
         except tweepy.errors.TooManyRequests:
-            print("Rate limit hit. Sleeping 15 mins.")
-            time.sleep(900)
+            print("Rate limit hit. Waiting for 15 minutes...")
+            time.sleep(900) 
         except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(60)
+            print(f"Error occurred during posting: {e}")
+            # Wait 60 seconds before retrying to avoid spamming errors
+            time.sleep(60) 
 
 if __name__ == "__main__":
     run_scheduler()
